@@ -1,0 +1,235 @@
+#!/bin/bash
+
+# ====== Màu sắc ======
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+CONFIG_FILE="/etc/danted.env"
+
+# ====== Encode URL (dùng khi test proxy) ======
+url_encode() {
+    local raw="$1"
+    local encoded=""
+    for (( i=0; i<${#raw}; i++ )); do
+        char="${raw:i:1}"
+        case "$char" in
+            [a-zA-Z0-9._~-]) encoded+="$char" ;;
+            *) encoded+=$(printf '%%%02X' "'$char") ;;
+        esac
+    done
+    echo "$encoded"
+}
+
+# ====== Hàm cài đặt / cấu hình Dante ======
+install_dante() {
+    local port="$1"
+    sudo apt update -y
+    sudo apt install dante-server curl -y
+
+    # Tạo log file
+    sudo touch /var/log/danted.log
+    sudo chown nobody:nogroup /var/log/danted.log
+
+    # Interface chính
+    primary_interface=$(ip route | grep default | awk '{print $5}')
+    [[ -z "$primary_interface" ]] && echo -e "${RED}Không tìm thấy interface mạng.${NC}" && exit 1
+
+    # File config
+    sudo bash -c "cat <<EOF > /etc/danted.conf
+logoutput: /var/log/danted.log
+internal: 0.0.0.0 port = $port
+external: $primary_interface
+method: username
+user.privileged: root
+user.notprivileged: nobody
+client pass {
+    from: 0/0 to: 0/0
+    log: connect disconnect error
+}
+socks pass {
+    from: 0/0 to: 0/0
+    log: connect disconnect error
+}
+EOF"
+
+    # Firewall
+    if command -v ufw >/dev/null && sudo ufw status | grep -q "Status: active"; then
+        sudo ufw allow "$port/tcp"
+    elif command -v iptables >/dev/null; then
+        sudo iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
+    fi
+
+    # Bật tự khởi động + restart khi lỗi
+    sudo mkdir -p /etc/systemd/system/danted.service.d
+    cat <<EOF | sudo tee /etc/systemd/system/danted.service.d/override.conf >/dev/null
+[Service]
+Restart=always
+RestartSec=3
+ReadWriteDirectories=/var/log
+EOF
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now danted
+
+    # Thêm logrotate
+    sudo bash -c "cat <<EOF > /etc/logrotate.d/danted
+/var/log/danted.log {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    create 640 nobody nogroup
+    postrotate
+        systemctl reload danted >/dev/null 2>&1 || true
+    endscript
+}
+EOF"
+
+    # Lưu port vào file cấu hình
+    echo "PORT=$port" | sudo tee "$CONFIG_FILE" >/dev/null
+
+    echo -e "${GREEN}Dante SOCKS5 đã cài & chạy ở port $port.${NC}"
+}
+
+# ====== Thêm user SOCKS5 ======
+add_user() {
+    local username="$1"
+    local password="$2"
+    if id "$username" &>/dev/null; then
+        echo -e "${YELLOW}User $username đã tồn tại, đổi mật khẩu...${NC}"
+    else
+        sudo useradd --shell /usr/sbin/nologin "$username"
+        echo -e "${GREEN}Tạo user $username thành công.${NC}"
+    fi
+    echo "$username:$password" | sudo chpasswd
+
+    # Lưu user/pass vào file cấu hình
+    sudo sed -i "/^USER_${username}=/d" "$CONFIG_FILE" 2>/dev/null || true
+    sudo sed -i "/^PASS_${username}=/d" "$CONFIG_FILE" 2>/dev/null || true
+    echo "USER_${username}=$username" | sudo tee -a "$CONFIG_FILE" >/dev/null
+    echo "PASS_${username}=$password" | sudo tee -a "$CONFIG_FILE" >/dev/null
+}
+
+# ====== Test proxy ======
+test_proxy() {
+    local username="$1"
+    local password="$2"
+    local port="$3"
+    proxy_ip=$(hostname -I | awk '{print $1}')
+    encoded_username=$(url_encode "$username")
+    encoded_password=$(url_encode "$password")
+
+    echo -e "${CYAN}Test proxy...${NC}"
+    curl --socks5 "$encoded_username:$encoded_password@$proxy_ip:$port" https://ipinfo.io/ || \
+    echo -e "${RED}Proxy test thất bại.${NC}"
+}
+
+# ====== Cài watchdog ======
+install_watchdog() {
+sudo bash -c "cat <<'EOF' > /usr/local/bin/danted-watchdog.sh
+#!/bin/bash
+set -e
+CONFIG_FILE=/etc/danted.env
+[ -f \$CONFIG_FILE ] && source \$CONFIG_FILE
+
+# Check Dante process
+if ! pgrep -x danted >/dev/null; then
+    systemctl restart danted
+fi
+
+# Check port
+if ! ss -tuln | grep -q ":${PORT:-1080} "; then
+    systemctl restart danted
+fi
+
+# Restore user/pass
+for var in \$(compgen -A variable | grep ^USER_); do
+    user="\${!var}"
+    pass_var="PASS_\${user}"
+    pass="\${!pass_var}"
+    if ! id "\$user" &>/dev/null; then
+        useradd --shell /usr/sbin/nologin "\$user"
+        echo "\$user:\$pass" | chpasswd
+    fi
+done
+EOF"
+
+    sudo chmod +x /usr/local/bin/danted-watchdog.sh
+
+    # Service
+    sudo bash -c "cat <<EOF > /etc/systemd/system/danted-watchdog.service
+[Unit]
+Description=Dante Proxy Watchdog
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/danted-watchdog.sh
+EOF"
+
+    # Timer
+    sudo bash -c "cat <<EOF > /etc/systemd/system/danted-watchdog.timer
+[Unit]
+Description=Run Dante Proxy Watchdog every 1 minute
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+Unit=danted-watchdog.service
+
+[Install]
+WantedBy=timers.target
+EOF"
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now danted-watchdog.timer
+
+    echo -e "${GREEN}Watchdog đã được bật (kiểm tra proxy mỗi phút).${NC}"
+}
+
+# ====== Menu ======
+if command -v danted &>/dev/null; then
+    echo -e "${CYAN}Dante đã cài. Chọn hành động:${NC}"
+    echo "1) Reconfigure"
+    echo "2) Add user"
+    echo "3) Uninstall"
+    echo "4) Exit"
+    read -p "Chọn: " choice
+else
+    choice="1"
+fi
+
+case $choice in
+    1)
+        read -p "Port SOCKS5 (default 1080): " port
+        port=${port:-1080}
+        install_dante "$port"
+        read -p "Nhập username: " username
+        read -s -p "Nhập password: " password
+        echo
+        add_user "$username" "$password"
+        test_proxy "$username" "$password" "$port"
+        install_watchdog
+        ;;
+    2)
+        read -p "Nhập username: " username
+        read -s -p "Nhập password: " password
+        echo
+        source "$CONFIG_FILE"
+        port=${PORT:-1080}
+        add_user "$username" "$password"
+        test_proxy "$username" "$password" "$port"
+        ;;
+    3)
+        sudo systemctl stop danted danted-watchdog.timer danted-watchdog.service
+        sudo systemctl disable danted danted-watchdog.timer danted-watchdog.service
+        sudo apt remove --purge dante-server -y
+        sudo rm -f /etc/danted.conf /var/log/danted.log /etc/logrotate.d/danted \
+            /usr/local/bin/danted-watchdog.sh "$CONFIG_FILE"
+        echo -e "${GREEN}Đã gỡ Dante SOCKS5.${NC}"
+        ;;
+    4) exit 0 ;;
+esac
