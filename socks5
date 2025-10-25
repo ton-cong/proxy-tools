@@ -1,17 +1,16 @@
 #!/bin/bash
+# SOCKS5 (Dante) Installer & Manager for Amazon Linux 2023/2 (EC2)
+# Features: Install, Reconfigure, Add User, Uninstall
+# Author: ChatGPT GPT-5
 
-# Define color codes
+# ========== COLOR CODES ==========
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
+YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-DANTE_CONFIG="/etc/danted.conf"
-DANTE_SERVICE="/etc/systemd/system/danted.service"
-DANTE_BIN="/usr/local/sbin/sockd"
-
-# Function to URL-encode username and password
+# ========== URL ENCODE FUNCTION ==========
 url_encode() {
     local raw="$1"
     local encoded=""
@@ -25,225 +24,122 @@ url_encode() {
     echo "$encoded"
 }
 
-# Function to get public IP
-get_public_ip() {
-    curl -s ifconfig.me || curl -s icanhazip.com || hostname -I | awk '{print $1}'
-}
-
-# Function to get network interface
-get_network_interface() {
-    ip -o -4 route show to default | awk '{print $5}' | head -n1
-}
-
-# Function to install Dante from source
-install_dante() {
-    echo -e "${YELLOW}Installing dependencies...${NC}"
-    yum install -y gcc make wget tar shadow-utils curl >/dev/null 2>&1
-    
-    echo -e "${YELLOW}Downloading and building Dante Server...${NC}"
-    cd /tmp
-    if [ ! -f "dante-1.4.3.tar.gz" ]; then
-        wget -q https://www.inet.no/dante/files/dante-1.4.3.tar.gz
-    fi
-    
-    tar xzf dante-1.4.3.tar.gz >/dev/null 2>&1
-    cd dante-1.4.3
-    
-    ./configure >/dev/null 2>&1
-    make >/dev/null 2>&1
-    make install >/dev/null 2>&1
-    
-    cd /tmp
-    rm -rf dante-1.4.3*
-    
-    echo -e "${GREEN}Dante SOCKS5 server installed successfully.${NC}"
-}
-
-# Function to create Dante configuration
-create_dante_config() {
-    local port=$1
-    local interface=$(get_network_interface)
-    
-    cat <<EOF > $DANTE_CONFIG
-logoutput: /var/log/danted.log
-internal: 0.0.0.0 port = $port
-external: $interface
-method: username
-user.privileged: root
-user.notprivileged: nobody
-client pass {
-    from: 0/0 to: 0/0
-    log: connect disconnect error
-}
-socks pass {
-    from: 0/0 to: 0/0
-    log: connect disconnect error
-}
-EOF
-    
-    echo -e "${GREEN}Configuration file created successfully.${NC}"
-}
-
-# Function to create systemd service
-create_systemd_service() {
-    cat <<EOF > $DANTE_SERVICE
-[Unit]
-Description=Dante SOCKS5 Server
-After=network.target
-
-[Service]
-ExecStart=$DANTE_BIN -f $DANTE_CONFIG
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    
-    systemctl daemon-reload
-    systemctl enable danted >/dev/null 2>&1
-    echo -e "${GREEN}Systemd service created successfully.${NC}"
-}
-
-# Check if danted is installed
-if [ -f "$DANTE_BIN" ]; then
+# ========== CHECK EXISTING INSTALLATION ==========
+if command -v danted &>/dev/null; then
     echo -e "${GREEN}Dante SOCKS5 server is already installed.${NC}"
-    echo -e "${CYAN}Do you want to (1) Reconfigure, (2) Add a new user, (3) Uninstall, or (4) Exit? (Enter 1, 2, 3, or 4):${NC}"
-    read choice
-    if [[ "$choice" == "1" ]]; then
-        echo -e "${CYAN}Reconfiguring requires a port. Please enter the port for the SOCKS5 proxy (default: 1080):${NC}"
-        read port
-        port=${port:-1080}
-        if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
-            echo -e "${RED}Invalid port. Please enter a number between 1 and 65535.${NC}"
-            exit 1
-        fi
-        reconfigure=true
-        add_user=false
-    elif [[ "$choice" == "2" ]]; then
-        echo -e "${CYAN}Adding a new user...${NC}"
-        reconfigure=false
-        add_user=true
-        # Get current port from config
-        port=$(grep "port =" $DANTE_CONFIG 2>/dev/null | awk '{print $4}')
-    elif [[ "$choice" == "3" ]]; then
-        echo -e "${YELLOW}Uninstalling Dante SOCKS5 server...${NC}"
-        systemctl stop danted
-        systemctl disable danted
-        rm -f $DANTE_SERVICE
-        rm -f $DANTE_CONFIG
-        rm -f /var/log/danted.log
-        rm -f $DANTE_BIN
-        rm -rf /usr/local/lib/libdsocks*
-        echo -e "${GREEN}Dante SOCKS5 server has been uninstalled successfully.${NC}"
-        exit 0
-    else
-        echo -e "${YELLOW}Exiting.${NC}"
-        exit 0
-    fi
+    echo -e "${CYAN}Do you want to (1) Reconfigure, (2) Add a new user, (3) Uninstall, or (4) Exit?${NC}"
+    read -p "Enter choice (1-4): " choice
+    case "$choice" in
+        1)
+            read -p "$(echo -e ${CYAN}Enter port (default: 1080):${NC} )" port
+            port=${port:-1080}
+            ;;
+        2)
+            add_user=true
+            ;;
+        3)
+            echo -e "${YELLOW}Uninstalling Dante SOCKS5...${NC}"
+            sudo systemctl stop danted
+            sudo systemctl disable danted
+            sudo dnf remove -y dante-server || sudo yum remove -y dante-server
+            sudo rm -f /etc/danted.conf /var/log/danted.log
+            echo -e "${GREEN}Uninstalled successfully.${NC}"
+            exit 0
+            ;;
+        4|*) echo -e "${YELLOW}Exit.${NC}"; exit 0 ;;
+    esac
 else
-    # First time installation - read from stdin or interactive
-    echo -e "${YELLOW}Dante SOCKS5 server is not installed on this system.${NC}"
-    echo -e "${CYAN}Note: Port 1080 is commonly used for SOCKS5 proxies. However, it may be blocked by your ISP or server provider. If this happens, choose an alternate port.${NC}"
-    echo -e "${CYAN}Please enter the port for the SOCKS5 proxy (default: 1080):${NC}"
-    read port
+    echo -e "${YELLOW}Dante SOCKS5 is not installed.${NC}"
+    read -p "$(echo -e ${CYAN}Enter port (default: 1080):${NC} )" port
     port=${port:-1080}
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
-        echo -e "${RED}Invalid port. Please enter a number between 1 and 65535.${NC}"
-        exit 1
-    fi
     reconfigure=true
     add_user=true
 fi
 
-# Install or Reconfigure Dante
-if [[ "$reconfigure" == "true" ]]; then
-    # Install Dante from source
-    install_dante
+# ========== INSTALL / RECONFIGURE ==========
+if [[ "$reconfigure" == "true" || "$choice" == "1" ]]; then
+    echo -e "${CYAN}Installing Dante SOCKS5...${NC}"
+    sudo dnf update -y || sudo yum update -y
+    sudo dnf install -y dante-server curl || sudo yum install -y dante-server curl
 
-    # Create the log file before starting the service
-    touch /var/log/danted.log
-    chown nobody:nobody /var/log/danted.log 2>/dev/null || chown nobody:nogroup /var/log/danted.log 2>/dev/null
+    echo -e "${GREEN}Installed successfully.${NC}"
+    sudo touch /var/log/danted.log
+    sudo chown nobody:nobody /var/log/danted.log || sudo chown nobody:nogroup /var/log/danted.log
 
-    # Create configuration
-    create_dante_config $port
-
-    # Configure firewall rules (Amazon Linux uses firewalld or iptables)
-    if firewall-cmd --state &>/dev/null; then
-        firewall-cmd --permanent --add-port="$port"/tcp >/dev/null 2>&1
-        firewall-cmd --reload >/dev/null 2>&1
-    elif command -v iptables &>/dev/null; then
-        if ! iptables -L | grep -q "tcp dpt:$port"; then
-            iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
-            # Save iptables rules
-            service iptables save 2>/dev/null || iptables-save | tee /etc/sysconfig/iptables >/dev/null 2>&1
-        fi
+    # Detect main network interface
+    primary_interface=$(ip route | awk '/default/ {print $5}' | head -n1)
+    if [[ -z "$primary_interface" ]]; then
+        echo -e "${RED}Could not detect network interface.${NC}"
+        exit 1
     fi
 
-    # Create systemd service
-    create_systemd_service
+    # Generate config
+    sudo bash -c "cat > /etc/danted.conf" <<EOF
+logoutput: /var/log/danted.log
+internal: 0.0.0.0 port = $port
+external: $primary_interface
+method: username
+user.privileged: root
+user.notprivileged: nobody
 
-    # Reload the systemd daemon and restart the service
-    systemctl daemon-reload
-    systemctl restart danted
-    systemctl enable danted
+client pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: connect disconnect error
+}
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: connect disconnect error
+}
+EOF
 
-    # Check if the service is active
-    if systemctl is-active --quiet danted; then
-        echo -e "${GREEN}\nSocks5 server has been reconfigured and is running on port - $port${NC}"
+    # Open firewall port if firewalld is running
+    if systemctl is-active --quiet firewalld; then
+        sudo firewall-cmd --permanent --add-port=${port}/tcp
+        sudo firewall-cmd --reload
     else
-        echo -e "${RED}\nFailed to start the Socks5 server. Please check the logs for more details: /var/log/danted.log${NC}"
-        echo -e "${YELLOW}You can check the logs with: journalctl -u danted -n 50${NC}"
+        sudo iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+    fi
+
+    sudo systemctl enable danted
+    sudo systemctl restart danted
+
+    if systemctl is-active --quiet danted; then
+        echo -e "${GREEN}SOCKS5 is running on port ${port}.${NC}"
+    else
+        echo -e "${RED}Failed to start SOCKS5 server. Check /var/log/danted.log.${NC}"
         exit 1
     fi
 fi
 
-# Add user
+# ========== ADD USER ==========
 if [[ "$add_user" == "true" ]]; then
-    echo -e "${CYAN}Please enter the username for the SOCKS5 proxy:${NC}"
+    echo -e "${CYAN}Enter username:${NC}"
     read username
-    echo -e "${CYAN}Please enter the password for the SOCKS5 proxy:${NC}"
+    echo -e "${CYAN}Enter password:${NC}"
     read -s password
-    echo
+
     if id "$username" &>/dev/null; then
-        echo -e "${YELLOW}User @$username already exists. Updating password.${NC}"
+        echo -e "${YELLOW}User exists. Updating password...${NC}"
     else
-        useradd --shell /sbin/nologin "$username"
-        echo -e "${GREEN}User @$username created successfully.${NC}"
+        sudo useradd --shell /sbin/nologin "$username"
+        echo -e "${GREEN}User created.${NC}"
     fi
-    echo "$username:$password" | chpasswd
-    echo -e "${GREEN}Password updated successfully for user: $username.${NC}"
-    
-    # Restart service to apply changes
-    systemctl restart danted
+    echo "$username:$password" | sudo chpasswd
+    echo -e "${GREEN}Password updated.${NC}"
 fi
 
-# Test the SOCKS5 proxy
+# ========== TEST PROXY ==========
 if [[ "$add_user" == "true" ]]; then
-    echo -e "${CYAN}\nTesting the SOCKS5 proxy with curl...${NC}"
-    proxy_ip=$(get_public_ip)
+    echo -e "${CYAN}Testing SOCKS5 proxy...${NC}"
+    proxy_ip=$(hostname -I | awk '{print $1}')
     encoded_username=$(url_encode "$username")
     encoded_password=$(url_encode "$password")
 
-    echo -e "${YELLOW}Proxy Connection String:${NC}"
-    echo -e "socks5://$encoded_username:$encoded_password@$proxy_ip:$port"
-    echo
-
-    curl -x socks5://"$encoded_username":"$encoded_password"@"$proxy_ip":"$port" https://ipinfo.io/ 2>/dev/null
+    curl -x socks5://"$encoded_username":"$encoded_password"@"$proxy_ip":"$port" https://ipinfo.io/
 
     if [[ $? -eq 0 ]]; then
-        echo -e "${GREEN}\n✓ SOCKS5 proxy test successful. Proxy is working.${NC}"
-        echo -e "${GREEN}✓ Your proxy is ready to use!${NC}"
-        echo -e "\n${CYAN}╔════════════════════════════════════════╗${NC}"
-        echo -e "${CYAN}║         PROXY INFORMATION              ║${NC}"
-        echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
-        echo -e "🔌 ${YELLOW}IP:${NC}       $proxy_ip"
-        echo -e "🔐 ${YELLOW}Port:${NC}     $port"
-        echo -e "👤 ${YELLOW}Username:${NC} $username"
-        echo -e "🔑 ${YELLOW}Password:${NC} $password"
-        echo -e "\n${GREEN}Connection:${NC} socks5://$username:$password@$proxy_ip:$port\n"
+        echo -e "${GREEN}Proxy test successful.${NC}"
     else
-        echo -e "${RED}\n✗ SOCKS5 proxy test failed. Please check your configuration.${NC}"
-        echo -e "${YELLOW}Check logs: journalctl -u danted -n 50${NC}"
+        echo -e "${RED}Proxy test failed. Check configuration.${NC}"
     fi
 fi
