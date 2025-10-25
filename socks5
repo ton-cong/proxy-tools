@@ -1,235 +1,396 @@
 #!/bin/bash
 
-# ====== Màu sắc ======
+# SOCKS5 Proxy Manager cho Amazon Linux 2023/2
+# Hỗ trợ: Cài đặt, Thêm user, Xóa user, Xóa hoàn toàn
+# GitHub: https://github.com/yourusername/socks5-amazonlinux
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
 
-CONFIG_FILE="/etc/danted.env"
+DANTE_CONFIG="/etc/danted.conf"
+DANTE_SERVICE="/etc/systemd/system/danted.service"
+DANTE_BIN="/usr/local/sbin/sockd"
 
-# ====== Encode URL (dùng khi test proxy) ======
-url_encode() {
-    local raw="$1"
-    local encoded=""
-    for (( i=0; i<${#raw}; i++ )); do
-        char="${raw:i:1}"
-        case "$char" in
-            [a-zA-Z0-9._~-]) encoded+="$char" ;;
-            *) encoded+=$(printf '%%%02X' "'$char") ;;
-        esac
-    done
-    echo "$encoded"
+# Hàm kiểm tra quyền root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}Script này cần chạy với quyền root (sudo)${NC}"
+        exit 1
+    fi
 }
 
-# ====== Hàm cài đặt / cấu hình Dante ======
+# Hàm lấy IP public
+get_public_ip() {
+    curl -s ifconfig.me || curl -s icanhazip.com || echo "Unknown"
+}
+
+# Hàm lấy interface network
+get_network_interface() {
+    ip -o -4 route show to default | awk '{print $5}' | head -n1
+}
+
+# Hàm cài đặt Dante từ source
 install_dante() {
-    local port="$1"
-    sudo apt update -y
-    sudo apt install dante-server curl -y
+    echo -e "${YELLOW}Đang cài đặt dependencies...${NC}"
+    yum install -y gcc make wget tar shadow-utils >/dev/null 2>&1
+    
+    echo -e "${YELLOW}Đang tải và build Dante Server...${NC}"
+    cd /tmp
+    if [ ! -f "dante-1.4.3.tar.gz" ]; then
+        wget -q https://www.inet.no/dante/files/dante-1.4.3.tar.gz
+    fi
+    
+    tar xzf dante-1.4.3.tar.gz >/dev/null 2>&1
+    cd dante-1.4.3
+    
+    ./configure >/dev/null 2>&1
+    make >/dev/null 2>&1
+    make install >/dev/null 2>&1
+    
+    cd /tmp
+    rm -rf dante-1.4.3*
+    
+    echo -e "${GREEN}✓ Dante Server đã được cài đặt${NC}"
+}
 
-    # Tạo log file
-    sudo touch /var/log/danted.log
-    sudo chown nobody:nogroup /var/log/danted.log
-
-    # Interface chính
-    primary_interface=$(ip route | grep default | awk '{print $5}')
-    [[ -z "$primary_interface" ]] && echo -e "${RED}Không tìm thấy interface mạng.${NC}" && exit 1
-
-    # File config
-    sudo bash -c "cat <<EOF > /etc/danted.conf
+# Hàm tạo cấu hình Dante
+create_dante_config() {
+    local port=$1
+    local interface=$(get_network_interface)
+    
+    cat > $DANTE_CONFIG <<EOF
 logoutput: /var/log/danted.log
 internal: 0.0.0.0 port = $port
-external: $primary_interface
+external: $interface
+
 method: username
-user.privileged: root
 user.notprivileged: nobody
+
 client pass {
-    from: 0/0 to: 0/0
-    log: connect disconnect error
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: connect disconnect
 }
-socks pass {
-    from: 0/0 to: 0/0
-    log: connect disconnect error
+
+pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    protocol: tcp udp
+    method: username
+    log: connect disconnect
 }
-EOF"
+EOF
+    
+    echo -e "${GREEN}✓ Đã tạo file cấu hình${NC}"
+}
 
-    # Firewall
-    if command -v ufw >/dev/null && sudo ufw status | grep -q "Status: active"; then
-        sudo ufw allow "$port/tcp"
-    elif command -v iptables >/dev/null; then
-        sudo iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
-    fi
+# Hàm tạo systemd service
+create_systemd_service() {
+    cat > $DANTE_SERVICE <<EOF
+[Unit]
+Description=Dante SOCKS5 Server
+After=network.target
 
-    # Bật tự khởi động + restart khi lỗi
-    sudo mkdir -p /etc/systemd/system/danted.service.d
-    cat <<EOF | sudo tee /etc/systemd/system/danted.service.d/override.conf >/dev/null
 [Service]
+ExecStart=$DANTE_BIN -f $DANTE_CONFIG
 Restart=always
 RestartSec=3
-ReadWriteDirectories=/var/log
-EOF
-
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now danted
-
-    # Thêm logrotate
-    sudo bash -c "cat <<EOF > /etc/logrotate.d/danted
-/var/log/danted.log {
-    daily
-    rotate 7
-    compress
-    missingok
-    notifempty
-    create 640 nobody nogroup
-    postrotate
-        systemctl reload danted >/dev/null 2>&1 || true
-    endscript
-}
-EOF"
-
-    # Lưu port vào file cấu hình
-    echo "PORT=$port" | sudo tee "$CONFIG_FILE" >/dev/null
-
-    echo -e "${GREEN}Dante SOCKS5 đã cài & chạy ở port $port.${NC}"
-}
-
-# ====== Thêm user SOCKS5 ======
-add_user() {
-    local username="$1"
-    local password="$2"
-    if id "$username" &>/dev/null; then
-        echo -e "${YELLOW}User $username đã tồn tại, đổi mật khẩu...${NC}"
-    else
-        sudo useradd --shell /usr/sbin/nologin "$username"
-        echo -e "${GREEN}Tạo user $username thành công.${NC}"
-    fi
-    echo "$username:$password" | sudo chpasswd
-
-    # Lưu user/pass vào file cấu hình
-    sudo sed -i "/^USER_${username}=/d" "$CONFIG_FILE" 2>/dev/null || true
-    sudo sed -i "/^PASS_${username}=/d" "$CONFIG_FILE" 2>/dev/null || true
-    echo "USER_${username}=$username" | sudo tee -a "$CONFIG_FILE" >/dev/null
-    echo "PASS_${username}=$password" | sudo tee -a "$CONFIG_FILE" >/dev/null
-}
-
-# ====== Test proxy ======
-test_proxy() {
-    local username="$1"
-    local password="$2"
-    local port="$3"
-    proxy_ip=$(hostname -I | awk '{print $1}')
-    encoded_username=$(url_encode "$username")
-    encoded_password=$(url_encode "$password")
-
-    echo -e "${CYAN}Test proxy...${NC}"
-    curl --socks5 "$encoded_username:$encoded_password@$proxy_ip:$port" https://ipinfo.io/ || \
-    echo -e "${RED}Proxy test thất bại.${NC}"
-}
-
-# ====== Cài watchdog ======
-install_watchdog() {
-sudo bash -c "cat <<'EOF' > /usr/local/bin/danted-watchdog.sh
-#!/bin/bash
-set -e
-CONFIG_FILE=/etc/danted.env
-[ -f \$CONFIG_FILE ] && source \$CONFIG_FILE
-
-# Check Dante process
-if ! pgrep -x danted >/dev/null; then
-    systemctl restart danted
-fi
-
-# Check port
-if ! ss -tuln | grep -q ":${PORT:-1080} "; then
-    systemctl restart danted
-fi
-
-# Restore user/pass
-for var in \$(compgen -A variable | grep ^USER_); do
-    user="\${!var}"
-    pass_var="PASS_\${user}"
-    pass="\${!pass_var}"
-    if ! id "\$user" &>/dev/null; then
-        useradd --shell /usr/sbin/nologin "\$user"
-        echo "\$user:\$pass" | chpasswd
-    fi
-done
-EOF"
-
-    sudo chmod +x /usr/local/bin/danted-watchdog.sh
-
-    # Service
-    sudo bash -c "cat <<EOF > /etc/systemd/system/danted-watchdog.service
-[Unit]
-Description=Dante Proxy Watchdog
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/danted-watchdog.sh
-EOF"
-
-    # Timer
-    sudo bash -c "cat <<EOF > /etc/systemd/system/danted-watchdog.timer
-[Unit]
-Description=Run Dante Proxy Watchdog every 1 minute
-
-[Timer]
-OnBootSec=30
-OnUnitActiveSec=60
-Unit=danted-watchdog.service
 
 [Install]
-WantedBy=timers.target
-EOF"
-
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now danted-watchdog.timer
-
-    echo -e "${GREEN}Watchdog đã được bật (kiểm tra proxy mỗi phút).${NC}"
+WantedBy=multi-user.target
+EOF
+    
+    systemctl daemon-reload
+    systemctl enable danted >/dev/null 2>&1
+    echo -e "${GREEN}✓ Đã tạo systemd service${NC}"
 }
 
-# ====== Menu ======
-if command -v danted &>/dev/null; then
-    echo -e "${CYAN}Dante đã cài. Chọn hành động:${NC}"
-    echo "1) Reconfigure"
-    echo "2) Add user"
-    echo "3) Uninstall"
-    echo "4) Exit"
-    read -p "Chọn: " choice
-else
-    choice="1"
-fi
+# Hàm cài đặt SOCKS5
+install_socks5() {
+    echo -e "${GREEN}=== CÀI ĐẶT SOCKS5 PROXY ===${NC}\n"
+    
+    # Nhập thông tin
+    read -p "Nhập PORT (mặc định 1080): " port
+    port=${port:-1080}
+    
+    read -p "Nhập USERNAME: " username
+    while [ -z "$username" ]; do
+        echo -e "${RED}Username không được để trống!${NC}"
+        read -p "Nhập USERNAME: " username
+    done
+    
+    read -sp "Nhập PASSWORD: " password
+    echo
+    while [ -z "$password" ]; do
+        echo -e "${RED}Password không được để trống!${NC}"
+        read -sp "Nhập PASSWORD: " password
+        echo
+    done
+    
+    # Cài đặt Dante nếu chưa có
+    if [ ! -f "$DANTE_BIN" ]; then
+        install_dante
+    fi
+    
+    # Tạo user
+    useradd -M -s /sbin/nologin $username 2>/dev/null || true
+    echo "$username:$password" | chpasswd
+    echo -e "${GREEN}✓ Đã tạo user: $username${NC}"
+    
+    # Tạo cấu hình
+    create_dante_config $port
+    
+    # Tạo service
+    create_systemd_service
+    
+    # Khởi động dịch vụ
+    systemctl restart danted
+    sleep 2
+    
+    # Hiển thị thông tin
+    local ip=$(get_public_ip)
+    
+    echo -e "\n${GREEN}╔═══════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║   SOCKS5 PROXY ĐÃ CÀI ĐẶT THÀNH CÔNG  ║${NC}"
+    echo -e "${GREEN}╚═══════════════════════════════════════╝${NC}\n"
+    echo -e "🔌 ${YELLOW}IP:${NC}       $ip"
+    echo -e "🔐 ${YELLOW}Port:${NC}     $port"
+    echo -e "👤 ${YELLOW}Username:${NC} $username"
+    echo -e "🔑 ${YELLOW}Password:${NC} $password"
+    echo -e "\n${GREEN}Cú pháp sử dụng:${NC}"
+    echo -e "socks5://$username:$password@$ip:$port"
+    echo -e "\n${GREEN}Test proxy:${NC}"
+    echo -e "curl -x socks5h://$username:$password@$ip:$port https://ifconfig.me\n"
+}
 
-case $choice in
-    1)
-        read -p "Port SOCKS5 (default 1080): " port
-        port=${port:-1080}
-        install_dante "$port"
-        read -p "Nhập username: " username
-        read -s -p "Nhập password: " password
+# Hàm thêm user mới
+add_user() {
+    echo -e "${GREEN}=== THÊM USER MỚI ===${NC}\n"
+    
+    if [ ! -f "$DANTE_BIN" ]; then
+        echo -e "${RED}SOCKS5 chưa được cài đặt! Vui lòng cài đặt trước.${NC}"
+        exit 1
+    fi
+    
+    read -p "Nhập USERNAME mới: " username
+    while [ -z "$username" ]; do
+        echo -e "${RED}Username không được để trống!${NC}"
+        read -p "Nhập USERNAME mới: " username
+    done
+    
+    # Kiểm tra user đã tồn tại
+    if id "$username" &>/dev/null; then
+        echo -e "${YELLOW}User $username đã tồn tại!${NC}"
+        read -p "Bạn có muốn đổi mật khẩu? (y/n): " change_pass
+        if [ "$change_pass" != "y" ]; then
+            return
+        fi
+    fi
+    
+    read -sp "Nhập PASSWORD: " password
+    echo
+    while [ -z "$password" ]; do
+        echo -e "${RED}Password không được để trống!${NC}"
+        read -sp "Nhập PASSWORD: " password
         echo
-        add_user "$username" "$password"
-        test_proxy "$username" "$password" "$port"
-        install_watchdog
-        ;;
-    2)
-        read -p "Nhập username: " username
-        read -s -p "Nhập password: " password
-        echo
-        source "$CONFIG_FILE"
-        port=${PORT:-1080}
-        add_user "$username" "$password"
-        test_proxy "$username" "$password" "$port"
-        ;;
-    3)
-        sudo systemctl stop danted danted-watchdog.timer danted-watchdog.service
-        sudo systemctl disable danted danted-watchdog.timer danted-watchdog.service
-        sudo apt remove --purge dante-server -y
-        sudo rm -f /etc/danted.conf /var/log/danted.log /etc/logrotate.d/danted \
-            /usr/local/bin/danted-watchdog.sh "$CONFIG_FILE"
-        echo -e "${GREEN}Đã gỡ Dante SOCKS5.${NC}"
-        ;;
-    4) exit 0 ;;
-esac
+    done
+    
+    # Tạo hoặc cập nhật user
+    useradd -M -s /sbin/nologin $username 2>/dev/null || true
+    echo "$username:$password" | chpasswd
+    
+    # Lấy thông tin
+    local ip=$(get_public_ip)
+    local port=$(grep "port =" $DANTE_CONFIG | awk '{print $4}')
+    
+    systemctl restart danted
+    
+    echo -e "\n${GREEN}✓ User đã được thêm/cập nhật thành công!${NC}\n"
+    echo -e "🔌 ${YELLOW}IP:${NC}       $ip"
+    echo -e "🔐 ${YELLOW}Port:${NC}     $port"
+    echo -e "👤 ${YELLOW}Username:${NC} $username"
+    echo -e "🔑 ${YELLOW}Password:${NC} $password"
+    echo -e "\n${GREEN}Cú pháp:${NC} socks5://$username:$password@$ip:$port\n"
+}
+
+# Hàm liệt kê users
+list_users() {
+    echo -e "${GREEN}=== DANH SÁCH USERS ===${NC}\n"
+    
+    if [ ! -f "$DANTE_CONFIG" ]; then
+        echo -e "${RED}SOCKS5 chưa được cài đặt!${NC}"
+        return
+    fi
+    
+    local ip=$(get_public_ip)
+    local port=$(grep "port =" $DANTE_CONFIG 2>/dev/null | awk '{print $4}')
+    
+    echo -e "${YELLOW}Server:${NC} $ip:$port\n"
+    echo -e "${YELLOW}Users (có thể dùng cho SOCKS5):${NC}"
+    
+    # Lấy danh sách users có shell /sbin/nologin (users cho proxy)
+    awk -F: '$7 == "/sbin/nologin" {print "  • " $1}' /etc/passwd
+    echo
+}
+
+# Hàm xóa user
+delete_user() {
+    echo -e "${GREEN}=== XÓA USER ===${NC}\n"
+    
+    list_users
+    
+    read -p "Nhập username cần xóa: " username
+    
+    if [ -z "$username" ]; then
+        echo -e "${RED}Username không được để trống!${NC}"
+        return
+    fi
+    
+    if ! id "$username" &>/dev/null; then
+        echo -e "${RED}User $username không tồn tại!${NC}"
+        return
+    fi
+    
+    read -p "Bạn có chắc muốn xóa user $username? (y/n): " confirm
+    if [ "$confirm" = "y" ]; then
+        userdel $username 2>/dev/null
+        echo -e "${GREEN}✓ Đã xóa user: $username${NC}"
+        systemctl restart danted
+    else
+        echo -e "${YELLOW}Hủy bỏ thao tác${NC}"
+    fi
+}
+
+# Hàm xóa hoàn toàn SOCKS5
+uninstall_socks5() {
+    echo -e "${RED}=== XÓA HOÀN TOÀN SOCKS5 ===${NC}\n"
+    
+    read -p "⚠️  Bạn có CHẮC CHẮN muốn xóa toàn bộ SOCKS5? (yes/no): " confirm
+    
+    if [ "$confirm" != "yes" ]; then
+        echo -e "${YELLOW}Hủy bỏ thao tác${NC}"
+        return
+    fi
+    
+    echo -e "${YELLOW}Đang xóa...${NC}"
+    
+    # Dừng service
+    systemctl stop danted 2>/dev/null
+    systemctl disable danted 2>/dev/null
+    
+    # Xóa files
+    rm -f $DANTE_SERVICE
+    rm -f $DANTE_CONFIG
+    rm -f /var/log/danted.log
+    rm -f $DANTE_BIN
+    rm -rf /usr/local/sbin/sockd
+    rm -rf /usr/local/lib/libdsocks*
+    
+    # Xóa users proxy (có shell /sbin/nologin)
+    awk -F: '$7 == "/sbin/nologin" {print $1}' /etc/passwd | while read user; do
+        userdel $user 2>/dev/null
+    done
+    
+    systemctl daemon-reload
+    
+    echo -e "${GREEN}✓ Đã xóa hoàn toàn SOCKS5 Proxy${NC}\n"
+}
+
+# Hàm hiển thị trạng thái
+show_status() {
+    echo -e "${GREEN}=== TRẠNG THÁI SOCKS5 ===${NC}\n"
+    
+    if [ ! -f "$DANTE_BIN" ]; then
+        echo -e "${RED}SOCKS5 chưa được cài đặt!${NC}"
+        return
+    fi
+    
+    local ip=$(get_public_ip)
+    local port=$(grep "port =" $DANTE_CONFIG 2>/dev/null | awk '{print $4}')
+    
+    echo -e "🔌 ${YELLOW}IP:${NC}   $ip"
+    echo -e "🔐 ${YELLOW}Port:${NC} $port\n"
+    
+    if systemctl is-active --quiet danted; then
+        echo -e "📊 ${GREEN}Service: RUNNING ✓${NC}"
+    else
+        echo -e "📊 ${RED}Service: STOPPED ✗${NC}"
+    fi
+    
+    echo -e "\n${YELLOW}Số lượng users:${NC}"
+    awk -F: '$7 == "/sbin/nologin" {print "  • " $1}' /etc/passwd
+    
+    echo -e "\n${YELLOW}Kiểm tra port:${NC}"
+    if netstat -tuln 2>/dev/null | grep -q ":$port "; then
+        echo -e "  ${GREEN}✓ Port $port đang mở${NC}"
+    else
+        echo -e "  ${RED}✗ Port $port không mở${NC}"
+    fi
+    echo
+}
+
+# Menu chính
+show_menu() {
+    clear
+    echo -e "${GREEN}╔════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║     SOCKS5 PROXY - AMAZON LINUX       ║${NC}"
+    echo -e "${GREEN}╚════════════════════════════════════════╝${NC}\n"
+    echo "1. Cài đặt SOCKS5 Proxy"
+    echo "2. Thêm user mới"
+    echo "3. Liệt kê users"
+    echo "4. Xóa user"
+    echo "5. Xem trạng thái"
+    echo "6. Xóa hoàn toàn SOCKS5"
+    echo "0. Thoát"
+    echo -e "\n${YELLOW}Chọn chức năng [0-6]:${NC} "
+}
+
+# Hàm main
+main() {
+    check_root
+    
+    # Nếu có tham số từ stdin (chế độ tự động)
+    if [ -p /dev/stdin ]; then
+        read -t 0.1 port username password 2>/dev/null || true
+        if [ -n "$port" ] && [ -n "$username" ] && [ -n "$password" ]; then
+            # Cài đặt tự động
+            if [ ! -f "$DANTE_BIN" ]; then
+                install_dante
+            fi
+            
+            useradd -M -s /sbin/nologin $username 2>/dev/null || true
+            echo "$username:$password" | chpasswd
+            
+            create_dante_config $port
+            create_systemd_service
+            systemctl restart danted
+            
+            local ip=$(get_public_ip)
+            echo -e "\n${GREEN}✓ SOCKS5 đã cài đặt: socks5://$username:$password@$ip:$port${NC}\n"
+            exit 0
+        fi
+    fi
+    
+    # Menu tương tác
+    while true; do
+        show_menu
+        read -r choice
+        
+        case $choice in
+            1) install_socks5 ;;
+            2) add_user ;;
+            3) list_users ;;
+            4) delete_user ;;
+            5) show_status ;;
+            6) uninstall_socks5 ;;
+            0) echo -e "${GREEN}Tạm biệt!${NC}"; exit 0 ;;
+            *) echo -e "${RED}Lựa chọn không hợp lệ!${NC}" ;;
+        esac
+        
+        echo -e "\n${YELLOW}Nhấn Enter để tiếp tục...${NC}"
+        read
+    done
+}
+
+# Chạy script
+main
