@@ -345,51 +345,115 @@ show_menu() {
     echo -e "\n${YELLOW}Chọn chức năng [0-6]:${NC} "
 }
 
+# Hàm cài đặt lần đầu (không menu)
+first_install() {
+    echo -e "${GREEN}=== CÀI ĐẶT SOCKS5 PROXY LẦN ĐẦU ===${NC}\n"
+    
+    # Nhập PORT
+    read -p "Nhập PORT (mặc định 1080): " port
+    port=${port:-1080}
+    
+    # Nhập USERNAME
+    read -p "Nhập USERNAME: " username
+    while [ -z "$username" ]; do
+        echo -e "${RED}Username không được để trống!${NC}"
+        read -p "Nhập USERNAME: " username
+    done
+    
+    # Nhập PASSWORD
+    read -sp "Nhập PASSWORD: " password
+    echo
+    while [ -z "$password" ]; do
+        echo -e "${RED}Password không được để trống!${NC}"
+        read -sp "Nhập PASSWORD: " password
+        echo
+    done
+    
+    # Cài đặt Dante
+    install_dante
+    
+    # Tạo user
+    useradd -M -s /sbin/nologin $username 2>/dev/null || true
+    echo "$username:$password" | chpasswd
+    echo -e "${GREEN}✓ Đã tạo user: $username${NC}"
+    
+    # Tạo cấu hình
+    create_dante_config $port
+    
+    # Tạo service
+    create_systemd_service
+    
+    # Khởi động dịch vụ
+    systemctl restart danted
+    sleep 2
+    
+    # Hiển thị thông tin
+    local ip=$(get_public_ip)
+    
+    echo -e "\n${GREEN}╔═══════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║   SOCKS5 PROXY ĐÃ CÀI ĐẶT THÀNH CÔNG  ║${NC}"
+    echo -e "${GREEN}╚═══════════════════════════════════════╝${NC}\n"
+    echo -e "🔌 ${YELLOW}IP:${NC}       $ip"
+    echo -e "🔐 ${YELLOW}Port:${NC}     $port"
+    echo -e "👤 ${YELLOW}Username:${NC} $username"
+    echo -e "🔑 ${YELLOW}Password:${NC} $password"
+    echo -e "\n${GREEN}Cú pháp sử dụng:${NC}"
+    echo -e "socks5://$username:$password@$ip:$port"
+    echo -e "\n${GREEN}Test proxy:${NC}"
+    echo -e "curl -x socks5h://$username:$password@$ip:$port https://ifconfig.me\n"
+    
+    exit 0
+}
+
 # Hàm main
 main() {
     check_root
     
-    # Nếu có tham số từ stdin (chế độ tự động)
-    if [ -p /dev/stdin ]; then
-        read -t 0.1 port username password 2>/dev/null || true
-        if [ -n "$port" ] && [ -n "$username" ] && [ -n "$password" ]; then
-            # Cài đặt tự động
-            if [ ! -f "$DANTE_BIN" ]; then
+    # Kiểm tra xem đã cài SOCKS5 chưa
+    if [ ! -f "$DANTE_BIN" ]; then
+        # Chưa cài - Kiểm tra xem có input tự động không
+        if [ -p /dev/stdin ]; then
+            read -t 0.1 port username password 2>/dev/null || true
+            if [ -n "$port" ] && [ -n "$username" ] && [ -n "$password" ]; then
+                # Cài đặt tự động
                 install_dante
+                
+                useradd -M -s /sbin/nologin $username 2>/dev/null || true
+                echo "$username:$password" | chpasswd
+                
+                create_dante_config $port
+                create_systemd_service
+                systemctl restart danted
+                
+                local ip=$(get_public_ip)
+                echo -e "\n${GREEN}✓ SOCKS5 đã cài đặt: socks5://$username:$password@$ip:$port${NC}\n"
+                exit 0
             fi
-            
-            useradd -M -s /sbin/nologin $username 2>/dev/null || true
-            echo "$username:$password" | chpasswd
-            
-            create_dante_config $port
-            create_systemd_service
-            systemctl restart danted
-            
-            local ip=$(get_public_ip)
-            echo -e "\n${GREEN}✓ SOCKS5 đã cài đặt: socks5://$username:$password@$ip:$port${NC}\n"
-            exit 0
         fi
+        
+        # Cài đặt lần đầu với input thủ công
+        first_install
+    else
+        # Đã cài rồi - Hiển thị menu
+        while true; do
+            show_menu
+            read -r choice
+            
+            case $choice in
+                1) install_socks5 ;;
+                2) add_user ;;
+                3) list_users ;;
+                4) delete_user ;;
+                5) show_status ;;
+                6) uninstall_socks5 ;;
+                0) echo -e "${GREEN}Tạm biệt!${NC}"; exit 0 ;;
+                *) echo -e "${RED}Lựa chọn không hợp lệ!${NC}" ;;
+            esac
+            
+            echo -e "\n${YELLOW}Nhấn Enter để tiếp tục...${NC}"
+            read
+        done
     fi
-    
-    # Menu tương tác
-    while true; do
-        show_menu
-        read -r choice
-        
-        case $choice in
-            1) install_socks5 ;;
-            2) add_user ;;
-            3) list_users ;;
-            4) delete_user ;;
-            5) show_status ;;
-            6) uninstall_socks5 ;;
-            0) echo -e "${GREEN}Tạm biệt!${NC}"; exit 0 ;;
-            *) echo -e "${RED}Lựa chọn không hợp lệ!${NC}" ;;
-        esac
-        
-        echo -e "\n${YELLOW}Nhấn Enter để tiếp tục...${NC}"
-        read
-    done
 }
 
 # Chạy script
